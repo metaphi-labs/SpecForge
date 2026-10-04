@@ -83,6 +83,7 @@ def resume_contract(_config, draft_model, training_model):
     if steps > 1:
         contract["mtp_num_speculative_steps"] = steps
         contract["mtp_step_weights"] = list(training_model.step_weights)
+        contract["mtp_chain_context"] = str(training_model.chain_context)
     return contract
 
 
@@ -215,6 +216,7 @@ def build_training_model(config, draft_model, draft_config, target_config, token
             objective_chunk_size=config.training.mtp_objective_chunk_size,
             num_speculative_steps=config.training.mtp_num_speculative_steps,
             step_weight_beta=config.training.mtp_step_weight_beta,
+            chain_context=config.training.mtp_chain_context,
         ),
         capture_layers=None,
     )

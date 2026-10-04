@@ -934,6 +934,10 @@ class TrainingConfig(StrictConfigModel):
     mtp_num_speculative_steps: int = Field(default=1, ge=1)
     #: FastMTP exponential-decay base of the per-step loss weights.
     mtp_step_weight_beta: float = Field(default=0.6, gt=0.0)
+    #: What MTP draft steps >= 2 attend to: "sequence" (FastMTP: each step is a
+    #: full causal pass) or "prefix" (SGLang EAGLE/NEXTN serving recursion: the
+    #: prefix's step-1 entries plus the chain's own entries).
+    mtp_chain_context: Literal["sequence", "prefix"] = "sequence"
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None

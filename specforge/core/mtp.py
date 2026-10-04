@@ -52,6 +52,12 @@ class OnlineMTPModel(nn.Module):
             weights (only used when num_speculative_steps > 1).
         step_weights: Explicit per-step loss weights; overrides
             ``step_weight_beta`` when given.
+        chain_context: What a draft step k >= 2 attends to. ``"sequence"``
+            (FastMTP / #786): every step is a full causal pass, so position t
+            sees the step-k entries of earlier positions. ``"prefix"``: the
+            recursion of SGLang's EAGLE/NEXTN worker -- position t sees the
+            step-1 entries of the prefix (what draft-extend wrote into the
+            draft KV cache) plus only its own chain's entries.
     """
 
     def __init__(
@@ -62,6 +68,7 @@ class OnlineMTPModel(nn.Module):
         num_speculative_steps: int = 1,
         step_weight_beta: float = 0.6,
         step_weights: Optional[List[float]] = None,
+        chain_context: str = "sequence",
     ) -> None:
         super().__init__()
         if objective_chunk_size < 0:
@@ -85,6 +92,11 @@ class OnlineMTPModel(nn.Module):
                 f"num_speculative_steps={num_speculative_steps}"
             )
         self.step_weights = step_weights
+        if chain_context not in ("sequence", "prefix"):
+            raise ValueError(
+                f"chain_context must be 'sequence' or 'prefix', got {chain_context!r}"
+            )
+        self.chain_context = chain_context
 
     def _shift_for_next_token(
         self,
@@ -288,6 +300,7 @@ class OnlineMTPModel(nn.Module):
         corrects_per_step: List[torch.Tensor] = []
         denoms_per_step: List[torch.Tensor] = []
         current_hidden = hidden_states
+        chain_cache = {} if self.chain_context == "prefix" else None
         for step in range(steps):
             shift = step + 1
             step_ids = F.pad(input_ids[:, shift:], (0, shift), value=pad_token_id)
@@ -304,12 +317,22 @@ class OnlineMTPModel(nn.Module):
             ).unsqueeze(0)
             step_positions = torch.cat((position_ids[:, shift:], tail), dim=1)
 
-            draft_hidden = self.draft_model.forward_hidden(
-                input_ids=step_ids,
-                hidden_states=current_hidden,
-                attention_mask=step_attention,
-                position_ids=step_positions,
-            )
+            if chain_cache is None:
+                draft_hidden = self.draft_model.forward_hidden(
+                    input_ids=step_ids,
+                    hidden_states=current_hidden,
+                    attention_mask=step_attention,
+                    position_ids=step_positions,
+                )
+            else:
+                # Step 0 records the prefix K/V; later steps are chain steps.
+                draft_hidden = self.draft_model.forward_hidden(
+                    input_ids=step_ids,
+                    hidden_states=current_hidden,
+                    attention_mask=step_attention if step == 0 else None,
+                    position_ids=step_positions,
+                    chain_cache=chain_cache,
+                )
             loss, corrects, denoms = self._chunked_objective(
                 draft_hidden[:, :-1], input_ids, loss_mask, offset=step + 2
             )

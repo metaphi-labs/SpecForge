@@ -350,6 +350,113 @@ class MultiStepMTPTest(unittest.TestCase):
             OnlineMTPModel(self.draft, num_speculative_steps=3, step_weights=[1.0])
 
 
+class ServingRecursionTest(unittest.TestCase):
+    """chain_context="prefix": the SGLang EAGLE/NEXTN draft recursion."""
+
+    def _serving_reference(self, draft, input_ids, hidden_states, t, steps):
+        """Emulate serving for one anchor t (batch 1): draft-extend writes the
+        step-1 entries of the prefix; each later draft step appends one row
+        (next token + previous draft output) one position further, with plain
+        causal attention over the draft's KV cache."""
+        ids = input_ids[:, 1 : t + 2]  # x[1..t+1] fused with h[0..t]
+        hid = hidden_states[:, : t + 1]
+        outs = []
+        for k in range(steps):
+            pos = torch.arange(1, ids.shape[1] + 1).unsqueeze(0)
+            out = draft.forward_hidden(ids, hid, position_ids=pos)[:, -1:]
+            outs.append(out[0, 0])
+            if t + 2 + k >= input_ids.shape[1]:
+                break
+            ids = torch.cat([ids, input_ids[:, t + 2 + k : t + 3 + k]], dim=1)
+            hid = torch.cat([hid, out], dim=1)
+        return outs
+
+    def test_chain_steps_match_per_anchor_serving_emulation(self):
+        for impl in ("eager", "sdpa"):
+            with self.subTest(impl=impl):
+                torch.manual_seed(0)
+                config = _tiny_config()
+                config._attn_implementation = impl
+                draft = Qwen3_5MTPDraftModel(config).eval()
+                seq_len, steps = 14, 4
+                input_ids = torch.randint(0, config.vocab_size, (1, seq_len))
+                hidden = torch.randn(1, seq_len, config.hidden_size)
+                pad = config.pad_token_id
+                cache, current, per_step = {}, hidden, []
+                with torch.no_grad():
+                    for k in range(steps):
+                        shift = k + 1
+                        ids = torch.nn.functional.pad(
+                            input_ids[:, shift:], (0, shift), value=pad
+                        )
+                        pos = torch.arange(shift, seq_len + shift).unsqueeze(0)
+                        current = draft.forward_hidden(
+                            ids, current, position_ids=pos, chain_cache=cache
+                        )
+                        per_step.append(current)
+                    for t in (0, 3, 7, seq_len - steps - 1):
+                        ref = self._serving_reference(draft, input_ids, hidden, t, steps)
+                        for k, expected in enumerate(ref):
+                            torch.testing.assert_close(
+                                per_step[k][0, t], expected, atol=2e-5, rtol=2e-5
+                            )
+
+    def test_chain_step_ignores_other_anchors_chain_entries(self):
+        torch.manual_seed(0)
+        draft = Qwen3_5MTPDraftModel(_tiny_config()).eval()
+        ids = torch.randint(0, 128, (1, 12))
+        hidden = torch.randn(1, 12, 64)
+        pos = torch.arange(1, 13).unsqueeze(0)
+
+        def second_step(prev):
+            cache = {}
+            with torch.no_grad():
+                draft.forward_hidden(ids, hidden, position_ids=pos, chain_cache=cache)
+                return draft.forward_hidden(
+                    ids, prev, position_ids=pos + 1, chain_cache=cache
+                )
+
+        prev = torch.randn(1, 12, 64)
+        changed = prev.clone()
+        changed[:, 5] += 1.0
+        a, b = second_step(prev), second_step(changed)
+        keep = [i for i in range(12) if i != 5]
+        torch.testing.assert_close(a[:, keep], b[:, keep])
+        self.assertFalse(torch.allclose(a[:, 5], b[:, 5]))
+
+    def test_prefix_context_first_step_equals_single_step(self):
+        torch.manual_seed(0)
+        config = _tiny_config()
+        draft = Qwen3_5MTPDraftModel(config)
+        batch = _tiny_batch(config, seq_len=20)
+        single, _, _ = OnlineMTPModel(draft)(*batch)
+        multi, corrects, _ = OnlineMTPModel(
+            draft,
+            num_speculative_steps=3,
+            step_weights=[1.0, 0.0, 0.0],
+            chain_context="prefix",
+        )(*batch)
+        torch.testing.assert_close(multi, single, rtol=1e-5, atol=1e-6)
+        self.assertEqual(3, len(corrects))
+
+    def test_prefix_context_backward_is_finite(self):
+        torch.manual_seed(0)
+        config = _tiny_config()
+        draft = Qwen3_5MTPDraftModel(config)
+        loss, _, _ = OnlineMTPModel(
+            draft, num_speculative_steps=5, chain_context="prefix"
+        )(*_tiny_batch(config, seq_len=20))
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        for name, p in draft.mtp.named_parameters():
+            if p.requires_grad and p.grad is not None:
+                self.assertTrue(torch.isfinite(p.grad).all(), name)
+
+    def test_chain_context_rejects_unknown(self):
+        with self.assertRaisesRegex(ValueError, "chain_context"):
+            OnlineMTPModel(Qwen3_5MTPDraftModel(_tiny_config()), chain_context="x")
+
+
 class CausalityTest(unittest.TestCase):
     def test_draft_output_does_not_depend_on_future_positions(self):
         for impl in ("eager", "sdpa"):

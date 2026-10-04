@@ -178,6 +178,7 @@ class Qwen3MTPAttention(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        chain_cache: Optional[dict] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len, _ = hidden_states.size()
@@ -220,6 +221,21 @@ class Qwen3MTPAttention(nn.Module):
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
+
+        if chain_cache is not None:
+            # Serving recursion (see Qwen3_5MTPModel.forward): the first pass
+            # records the prefix K/V; a chain step attends to that prefix plus
+            # the K/V of its own chain (this step and the earlier chain steps).
+            layer = chain_cache.setdefault("layers", {}).setdefault(
+                self.layer_idx, {"chain": []}
+            )
+            if "prefix" not in layer:
+                layer["prefix"] = (key_states, value_states)
+            else:
+                layer["chain"].append((key_states, value_states))
+                entries = [layer["prefix"], *layer["chain"]]
+                key_states = torch.cat([k for k, _ in entries], dim=2)
+                value_states = torch.cat([v for _, v in entries], dim=2)
 
         attn_fn = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -347,7 +363,20 @@ class Qwen3_5MTPModel(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        chain_cache: Optional[dict] = None,
     ) -> torch.Tensor:
+        """Fuse, run the MTP layer(s), normalize.
+
+        ``chain_cache`` (a dict the caller keeps across calls) switches on the
+        serving recursion of SGLang's EAGLE/NEXTN worker for multi-step
+        training. The first call is the ordinary causal pass (draft step 1:
+        what draft-extend writes into the draft KV cache) and records its K/V
+        and mask. Every later call is a chain step: row t fuses the chain's
+        next token with the previous step's draft output for anchor t, sits
+        one position further, and attends to the recorded prefix entries
+        ``j <= t`` plus only its own chain's entries -- never to other anchors'
+        chain entries, which do not exist in the serving KV cache.
+        """
         # Fusion
         normed_emb = self.pre_fc_norm_embedding(inputs_embeds)
         normed_hidden = self.pre_fc_norm_hidden(hidden_states)
@@ -364,8 +393,12 @@ class Qwen3_5MTPModel(nn.Module):
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        is_chain_step = chain_cache is not None and "prefix_mask" in chain_cache
+
         # Causal mask
-        if attention_mask is not None and attention_mask.dim() == 2:
+        if is_chain_step:
+            pass  # built from the recorded prefix mask below
+        elif attention_mask is not None and attention_mask.dim() == 2:
             # [bsz, seq_len] -> [bsz, 1, seq_len, seq_len]
             combined_mask = _make_causal_mask(
                 (bsz, seq_len), hidden_states.dtype, device=hidden_states.device
@@ -379,12 +412,35 @@ class Qwen3_5MTPModel(nn.Module):
                 (bsz, seq_len), hidden_states.dtype, device=hidden_states.device
             )
 
+        if chain_cache is not None:
+            if not is_chain_step:
+                if attention_mask is None:  # seq_len == 1
+                    attention_mask = hidden_states.new_zeros(bsz, 1, seq_len, seq_len)
+                chain_cache["prefix_mask"] = attention_mask
+            else:
+                prefix_mask = chain_cache["prefix_mask"]
+                if "own_mask" not in chain_cache:
+                    own = torch.full(
+                        (seq_len, seq_len),
+                        torch.finfo(hidden_states.dtype).min,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                    own.fill_diagonal_(0)
+                    chain_cache["own_mask"] = own[None, None].expand(bsz, 1, -1, -1)
+                chain_cache["steps"] = chain_cache.get("steps", 0) + 1
+                attention_mask = torch.cat(
+                    [prefix_mask] + [chain_cache["own_mask"]] * chain_cache["steps"],
+                    dim=-1,
+                )
+
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
+                **({"chain_cache": chain_cache} if chain_cache is not None else {}),
             )[0]
 
         hidden_states = self.norm(hidden_states)
@@ -437,6 +493,7 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        chain_cache: Optional[dict] = None,
     ) -> torch.Tensor:
         inputs_embeds = self.embed_tokens(input_ids)
         return self.mtp(
@@ -444,6 +501,7 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            chain_cache=chain_cache,
         )
 
     def forward(
