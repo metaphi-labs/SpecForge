@@ -670,10 +670,16 @@ class MTPTrainStrategy(DraftTrainStrategy):
             "accuracy": (correct_sum / denom_sum.clamp_min(1)).detach(),
             "accuracy_denom": denom_sum.detach(),
         }
+        ratio_metrics = {"accuracy": (correct_sum, denom_sum)}
+        # Multi-step (FastMTP) training: teacher-forced accuracy per draft step.
+        for step in range(1, len(corrects)):
+            c, d = corrects[step].sum(), denoms[step].sum()
+            metrics[f"accuracy_step{step + 1}"] = (c / d.clamp_min(1)).detach()
+            ratio_metrics[f"accuracy_step{step + 1}"] = (c, d)
         return StepOutput(
             loss=loss,
             metrics=metrics,
-            ratio_metrics={"accuracy": (correct_sum, denom_sum)},
+            ratio_metrics=ratio_metrics,
             # TrainerCore backpropagates additive numerators and divides by the
             # global token denominator across accumulation steps / DP ranks.
             loss_terms=(loss * denom_sum, denom_sum),

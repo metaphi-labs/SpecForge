@@ -930,6 +930,10 @@ class TrainingConfig(StrictConfigModel):
     trim_loss_positions: bool = False
     #: MTP token positions per lm_head + CE chunk (0 disables chunking).
     mtp_objective_chunk_size: int = Field(default=4096, ge=0)
+    #: MTP teacher-forced draft steps per position (FastMTP); 1 = single step.
+    mtp_num_speculative_steps: int = Field(default=1, ge=1)
+    #: FastMTP exponential-decay base of the per-step loss weights.
+    mtp_step_weight_beta: float = Field(default=0.6, gt=0.0)
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None

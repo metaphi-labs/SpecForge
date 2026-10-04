@@ -68,7 +68,7 @@ def resume_contract(_config, draft_model, training_model):
     """Persist resolved MTP model and objective semantics."""
 
     mtp_config = getattr(draft_model.config, "mtp_config", None) or {}
-    return {
+    contract = {
         "mtp_draft_num_hidden_layers": int(
             getattr(draft_model.config, "num_hidden_layers", 1)
         ),
@@ -78,6 +78,12 @@ def resume_contract(_config, draft_model, training_model):
             getattr(draft_model.config, "_attn_implementation", "")
         ),
     }
+    # Multi-step (FastMTP) objectives only: single-step contracts are unchanged.
+    steps = int(getattr(training_model, "num_speculative_steps", 1))
+    if steps > 1:
+        contract["mtp_num_speculative_steps"] = steps
+        contract["mtp_step_weights"] = list(training_model.step_weights)
+    return contract
 
 
 def _init_from_native_mtp(cfg, draft_model) -> None:
@@ -207,6 +213,8 @@ def build_training_model(config, draft_model, draft_config, target_config, token
         model=OnlineMTPModel(
             draft_model=draft_model,
             objective_chunk_size=config.training.mtp_objective_chunk_size,
+            num_speculative_steps=config.training.mtp_num_speculative_steps,
+            step_weight_beta=config.training.mtp_step_weight_beta,
         ),
         capture_layers=None,
     )

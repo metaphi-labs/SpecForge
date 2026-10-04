@@ -14,6 +14,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def compute_step_weights(beta: float = 0.6, num_steps: int = 3) -> List[float]:
+    """Compute normalized exponential-decay step weights.
+
+    alpha_k = beta^(k-1) / sum(beta^(j-1) for j=1..K)
+
+    See FastMTP (arXiv:2509.18362), Equation 2.
+    """
+    raw = [beta**k for k in range(num_steps)]
+    total = sum(raw)
+    return [w / total for w in raw]
+
+
 class OnlineMTPModel(nn.Module):
     """
     Online MTP training wrapper.
@@ -34,6 +46,12 @@ class OnlineMTPModel(nn.Module):
             0 disables chunking. Configured by ``training.mtp_objective_chunk_size``
             in YAML. This bounds objective intermediates only; backbone
             activations, attention, weights, and optimizer state are unchanged.
+        num_speculative_steps: Number of teacher-forced draft steps per
+            position (1 = single-step native fine-tune, the default).
+        step_weight_beta: FastMTP exponential-decay base for per-step loss
+            weights (only used when num_speculative_steps > 1).
+        step_weights: Explicit per-step loss weights; overrides
+            ``step_weight_beta`` when given.
     """
 
     def __init__(
@@ -41,20 +59,38 @@ class OnlineMTPModel(nn.Module):
         draft_model: nn.Module,
         ploss_decay: float = 1.0,
         objective_chunk_size: int = 4096,
+        num_speculative_steps: int = 1,
+        step_weight_beta: float = 0.6,
+        step_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
         if objective_chunk_size < 0:
             raise ValueError(
                 f"objective_chunk_size must be >= 0, got {objective_chunk_size}"
             )
+        if num_speculative_steps < 1:
+            raise ValueError(
+                f"num_speculative_steps must be >= 1, got {num_speculative_steps}"
+            )
         self.draft_model = draft_model
         self.ploss_decay = ploss_decay
         self.objective_chunk_size = objective_chunk_size
+        self.num_speculative_steps = num_speculative_steps
+        self.step_weight_beta = step_weight_beta
+        if step_weights is None and num_speculative_steps > 1:
+            step_weights = compute_step_weights(step_weight_beta, num_speculative_steps)
+        if step_weights is not None and len(step_weights) != num_speculative_steps:
+            raise ValueError(
+                f"step_weights has {len(step_weights)} entries but "
+                f"num_speculative_steps={num_speculative_steps}"
+            )
+        self.step_weights = step_weights
 
     def _shift_for_next_token(
         self,
         input_ids: torch.Tensor,
         loss_mask: torch.Tensor,
+        offset: int = 2,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Shift labels/mask to match vLLM speculative decoding.
 
@@ -68,8 +104,9 @@ class OnlineMTPModel(nn.Module):
         # x_2..x_T has length seq_len-2; pad one position so its length equals
         # seq_len-1 (same as the shifted hidden states). The padded position is
         # ignored.
-        shift_labels = F.pad(input_ids[:, 2:], (0, 1), value=-100)
-        shift_mask = F.pad(loss_mask[:, 2:], (0, 1), value=0)
+        # Draft step k (0-based) predicts x_{t+k+2}: offset = k + 2.
+        shift_labels = F.pad(input_ids[:, offset:], (0, offset - 1), value=-100)
+        shift_mask = F.pad(loss_mask[:, offset:], (0, offset - 1), value=0)
         return shift_labels, shift_mask
 
     def _chunked_objective(
@@ -77,6 +114,7 @@ class OnlineMTPModel(nn.Module):
         shift_hidden: torch.Tensor,
         input_ids: torch.Tensor,
         loss_mask: torch.Tensor,
+        offset: int = 2,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply lm_head + cross-entropy in bounded chunks over positions.
 
@@ -85,7 +123,9 @@ class OnlineMTPModel(nn.Module):
         logits are freed (or recomputed under checkpointing) before the next
         chunk runs.
         """
-        shift_labels, shift_mask = self._shift_for_next_token(input_ids, loss_mask)
+        shift_labels, shift_mask = self._shift_for_next_token(
+            input_ids, loss_mask, offset
+        )
         batch, positions, hidden_size = shift_hidden.shape
         flat_hidden = shift_hidden.reshape(batch * positions, hidden_size)
         flat_labels = shift_labels.reshape(-1)
@@ -152,6 +192,11 @@ class OnlineMTPModel(nn.Module):
             acc_corrects: per-layer per-position correct tensors.
             acc_denoms: per-layer per-position denominator tensors.
         """
+        if self.num_speculative_steps > 1:
+            return self._forward_multi_step(
+                input_ids, hidden_states, loss_mask, attention_mask, position_ids
+            )
+
         # Draft input is the target sequence shifted right by one.  The last
         # position is padded because there is no x_{T+1}; its hidden state is
         # dropped before the objective in _chunked_objective.
@@ -202,3 +247,77 @@ class OnlineMTPModel(nn.Module):
 
         # Single-layer MTP: wrap in length-1 lists for E1 evaluator compatibility.
         return loss, [corrects], [denoms]
+
+    def _forward_multi_step(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        """Teacher-forced multi-step MTP training (FastMTP-style).
+
+        At step k (0-based) the draft consumes the ground-truth token
+        x[t+k+1] (embedded) at its own position p[t+k+1], fused with the
+        previous step's MTP output at index t (the target's last hidden state
+        at step 0), and predicts x[t+k+2]. This is how a single MTP head is
+        reused recursively at serving time. Each step's loss is weighted by
+        ``step_weights`` (normalized exponential decay, FastMTP Eq. 2), and
+        every step uses the same chunked lm_head + CE objective as the
+        single-step path. Step 0 is exactly the single-step objective.
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        pad_token_id = getattr(self.draft_model.config, "pad_token_id", 0)
+        if position_ids is None:
+            position_ids = (
+                torch.arange(seq_len, dtype=torch.long, device=device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
+        elif position_ids.shape != input_ids.shape:
+            raise ValueError(
+                "position_ids must have the same [batch, seq_len] shape as "
+                f"input_ids; got {tuple(position_ids.shape)} and "
+                f"{tuple(input_ids.shape)}"
+            )
+
+        steps = min(self.num_speculative_steps, max(1, seq_len - 2))
+        total_loss = None
+        corrects_per_step: List[torch.Tensor] = []
+        denoms_per_step: List[torch.Tensor] = []
+        current_hidden = hidden_states
+        for step in range(steps):
+            shift = step + 1
+            step_ids = F.pad(input_ids[:, shift:], (0, shift), value=pad_token_id)
+            step_attention = (
+                F.pad(attention_mask[:, shift:], (0, shift), value=0).to(
+                    attention_mask.dtype
+                )
+                if attention_mask is not None
+                else None
+            )
+            # Positions of the shifted tokens, extended monotonically past the end.
+            tail = position_ids[:, -1:] + torch.arange(
+                1, shift + 1, device=device, dtype=position_ids.dtype
+            ).unsqueeze(0)
+            step_positions = torch.cat((position_ids[:, shift:], tail), dim=1)
+
+            draft_hidden = self.draft_model.forward_hidden(
+                input_ids=step_ids,
+                hidden_states=current_hidden,
+                attention_mask=step_attention,
+                position_ids=step_positions,
+            )
+            loss, corrects, denoms = self._chunked_objective(
+                draft_hidden[:, :-1], input_ids, loss_mask, offset=step + 2
+            )
+            weighted = self.step_weights[step] * loss
+            total_loss = weighted if total_loss is None else total_loss + weighted
+            corrects_per_step.append(corrects)
+            denoms_per_step.append(denoms)
+            # The next step fuses its token embeddings with this step's output.
+            current_hidden = draft_hidden
+
+        return total_loss, corrects_per_step, denoms_per_step

@@ -24,7 +24,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.mtp.providers import _init_from_native_mtp
-from specforge.core.mtp import OnlineMTPModel
+from specforge.core.mtp import OnlineMTPModel, compute_step_weights
 from specforge.modeling.draft import available_drafts, resolve_draft
 from specforge.modeling.draft.mtp import Qwen3_5MTPDraftModel
 from specforge.training.strategies.base import MTPTrainStrategy
@@ -245,6 +245,109 @@ class OnlineMTPModelTest(unittest.TestCase):
         # x[t+1] is fused with h[t], but RoPE must use x[t+1]'s serving
         # position. The synthetic final token is assigned the next position.
         self.assertEqual([[5, 6, 7, 8]], draft.position_ids.tolist())
+
+
+def _single_step_reference(draft, input_ids, hidden_states, loss_mask):
+    """The single-step objective spelled out independently of OnlineMTPModel:
+    x[t+1] at position p[t+1] fused with h[t] predicts x[t+2]."""
+    batch, seq_len = input_ids.shape
+    pad = draft.config.pad_token_id
+    ids = torch.nn.functional.pad(input_ids[:, 1:], (0, 1), value=pad)
+    positions = torch.arange(1, seq_len + 1).unsqueeze(0).expand(batch, -1)
+    out = draft.forward_hidden(ids, hidden_states, position_ids=positions)[:, :-1]
+    logits = draft.mtp.lm_head(out)
+    labels = input_ids[:, 2:]
+    mask = loss_mask[:, 2:].float()
+    ce = torch.nn.functional.cross_entropy(
+        logits[:, : seq_len - 2].reshape(-1, logits.size(-1)),
+        labels.reshape(-1),
+        reduction="none",
+    )
+    return (ce * mask.reshape(-1)).sum() / mask.sum()
+
+
+class MultiStepMTPTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+        self.config = _tiny_config()
+        self.draft = Qwen3_5MTPDraftModel(self.config)
+        self.batch = _tiny_batch(self.config, seq_len=24)
+
+    def test_single_step_loss_unchanged(self):
+        input_ids, hidden_states, loss_mask = self.batch
+        loss, corrects, denoms = OnlineMTPModel(self.draft)(
+            input_ids, hidden_states, loss_mask
+        )
+        ref = _single_step_reference(self.draft, input_ids, hidden_states, loss_mask)
+        torch.testing.assert_close(loss, ref, rtol=1e-5, atol=1e-6)
+        self.assertEqual(1, len(corrects))
+
+    def test_step_weights_normalized_exponential_decay(self):
+        w = compute_step_weights(0.6, 3)
+        self.assertAlmostEqual(1.0, sum(w))
+        self.assertAlmostEqual(0.6, w[1] / w[0])
+        self.assertAlmostEqual(0.6, w[2] / w[1])
+
+    def test_k_step_with_only_first_weight_equals_single_step(self):
+        input_ids, hidden_states, loss_mask = self.batch
+        single, _, _ = OnlineMTPModel(self.draft)(input_ids, hidden_states, loss_mask)
+        multi, corrects, denoms = OnlineMTPModel(
+            self.draft, num_speculative_steps=3, step_weights=[1.0, 0.0, 0.0]
+        )(input_ids, hidden_states, loss_mask)
+        torch.testing.assert_close(multi, single, rtol=1e-5, atol=1e-6)
+        self.assertEqual(3, len(corrects))
+        self.assertEqual(3, len(denoms))
+
+    def test_k_step_feeds_previous_draft_output_and_shifts(self):
+        calls = []
+
+        class _RecordingDraft(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(pad_token_id=0)
+                self.mtp = SimpleNamespace(lm_head=torch.nn.Linear(8, 32, bias=False))
+
+            def forward_hidden(self, input_ids, hidden_states, attention_mask=None,
+                               position_ids=None):
+                calls.append((input_ids.clone(), hidden_states.clone(), position_ids.clone()))
+                return hidden_states + 1.0
+
+        model = OnlineMTPModel(_RecordingDraft(), num_speculative_steps=3)
+        input_ids = torch.tensor([[10, 11, 12, 13, 14, 15]])
+        model(input_ids, torch.zeros(1, 6, 8), torch.ones(1, 6),
+              position_ids=torch.tensor([[4, 5, 6, 7, 8, 9]]))
+        self.assertEqual(3, len(calls))
+        for k, (ids, hidden, pos) in enumerate(calls):
+            # step k sees x[t+k+1] at its own position, fused with step k-1's output
+            self.assertEqual(input_ids[0, k + 1:].tolist(), ids[0, : 5 - k].tolist())
+            self.assertEqual(list(range(5 + k, 11 + k)), pos[0].tolist())
+            self.assertTrue(torch.all(hidden == float(k)))
+
+    def test_k_step_labels_and_masks(self):
+        model = OnlineMTPModel(Qwen3_5MTPDraftModel(_tiny_config()))
+        labels, mask = model._shift_for_next_token(
+            torch.tensor([[10, 11, 12, 13, 14]]), torch.ones(1, 5), offset=4
+        )
+        # step 2 (0-based) predicts x_{t+4}: x_4 then ignored padding
+        self.assertEqual([14, -100, -100, -100], labels[0].tolist())
+        self.assertEqual([1, 0, 0, 0], mask[0].tolist())
+
+    def test_k_step_backward_is_finite_and_reaches_all_trainable_params(self):
+        input_ids, hidden_states, loss_mask = self.batch
+        self.draft.embed_tokens.weight.requires_grad_(False)
+        model = OnlineMTPModel(self.draft, num_speculative_steps=5)
+        loss, corrects, _ = model(input_ids, hidden_states, loss_mask)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        for name, p in self.draft.mtp.named_parameters():
+            if p.requires_grad:
+                self.assertIsNotNone(p.grad, name)
+                self.assertTrue(torch.isfinite(p.grad).all(), name)
+        self.assertEqual(5, len(corrects))
+
+    def test_step_weights_length_must_match(self):
+        with self.assertRaisesRegex(ValueError, "step_weights"):
+            OnlineMTPModel(self.draft, num_speculative_steps=3, step_weights=[1.0])
 
 
 class MTPTrainStrategyTest(unittest.TestCase):
