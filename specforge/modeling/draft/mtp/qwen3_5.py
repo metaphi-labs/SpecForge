@@ -235,8 +235,11 @@ class Qwen3MTPAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, -1)
+        # transformers' attention functions already return
+        # [batch, seq, heads, head_dim]; transposing again and viewing as
+        # [batch, seq, -1] interleaved heads with time steps, which both
+        # corrupted the layer and leaked future positions into earlier ones.
+        attn_output = attn_output.reshape(bsz, q_len, -1)
 
         if self.attn_output_gate:
             attn_output = attn_output * torch.sigmoid(gate)

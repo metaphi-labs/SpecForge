@@ -350,6 +350,26 @@ class MultiStepMTPTest(unittest.TestCase):
             OnlineMTPModel(self.draft, num_speculative_steps=3, step_weights=[1.0])
 
 
+class CausalityTest(unittest.TestCase):
+    def test_draft_output_does_not_depend_on_future_positions(self):
+        for impl in ("eager", "sdpa"):
+            with self.subTest(impl=impl):
+                torch.manual_seed(0)
+                config = _tiny_config()
+                config._attn_implementation = impl
+                draft = Qwen3_5MTPDraftModel(config).eval()
+                ids = torch.randint(0, config.vocab_size, (2, 16))
+                hidden = torch.randn(2, 16, config.hidden_size)
+                ids2, hidden2 = ids.clone(), hidden.clone()
+                ids2[:, 10:] = 5
+                hidden2[:, 10:] = 0
+                with torch.no_grad():
+                    a = draft.forward_hidden(ids, hidden)
+                    b = draft.forward_hidden(ids2, hidden2)
+                torch.testing.assert_close(a[:, :10], b[:, :10], atol=1e-5, rtol=1e-5)
+                self.assertFalse(torch.allclose(a[:, 10:], b[:, 10:]))
+
+
 class RopeConfigTest(unittest.TestCase):
     def test_rope_theta_read_from_v5_rope_parameters(self):
         draft = Qwen3_5MTPDraftModel(_tiny_config(rope_theta=10_000_000))
