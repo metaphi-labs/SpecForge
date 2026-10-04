@@ -350,6 +350,15 @@ class MultiStepMTPTest(unittest.TestCase):
             OnlineMTPModel(self.draft, num_speculative_steps=3, step_weights=[1.0])
 
 
+class RopeConfigTest(unittest.TestCase):
+    def test_rope_theta_read_from_v5_rope_parameters(self):
+        draft = Qwen3_5MTPDraftModel(_tiny_config(rope_theta=10_000_000))
+        inv_freq = draft.mtp.rotary_emb.inv_freq
+        dim = int(16 * 0.25)
+        expected = 1.0 / (10_000_000 ** (torch.arange(0, dim, 2).float() / dim))
+        torch.testing.assert_close(inv_freq, expected)
+
+
 class MTPTrainStrategyTest(unittest.TestCase):
     def test_forward_loss_adapts_model_outputs(self):
         loss = torch.tensor(1.5, requires_grad=True)

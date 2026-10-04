@@ -36,6 +36,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from typing_extensions import Unpack
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
+from specforge.modeling.draft.llama3_eagle import get_rope_config
 from specforge.modeling.draft.mtp.base import MTPDraftModel
 from specforge.modeling.draft.registry import register_draft
 
@@ -94,7 +95,10 @@ class PartialRotaryEmbedding(nn.Module):
 
     def __init__(self, config, head_dim):
         super().__init__()
-        rope_theta = getattr(config, "rope_theta", 10000.0)
+        # transformers v5 moves rope_theta into rope_parameters; reading the
+        # v4 attribute alone silently fell back to 10000 (serving uses the
+        # checkpoint's 1e7), a train/serve RoPE mismatch.
+        rope_theta, _ = get_rope_config(config)
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         dim = int(head_dim * partial_rotary_factor)
         inv_freq = 1.0 / (
