@@ -241,6 +241,29 @@ class Qwen3MTPAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        try:
+            attn_output, attn_weights = attn_fn(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+        except RuntimeError as e:
+            # cuDNN's fused attention refuses some shapes (seen on regenerated rows, never on recorded traffic):
+            # report the shape once, leave the cuDNN path for good, and take the step again.
+            if "mha_graph" not in str(e) or not torch.backends.cuda.cudnn_sdp_enabled():
+                raise
+            print(
+                f"[mtp-attn] cuDNN attention failed; query={tuple(query_states.shape)} key={tuple(key_states.shape)} "
+                f"mask={None if attention_mask is None else (tuple(attention_mask.shape), str(attention_mask.dtype))} "
+                f"dtype={query_states.dtype} layer={self.layer_idx}; cuDNN attention off from here",
+                flush=True,
+            )
+            torch.backends.cuda.enable_cudnn_sdp(False)
         attn_output, attn_weights = attn_fn(
             self,
             query_states,
